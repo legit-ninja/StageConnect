@@ -1,0 +1,130 @@
+import uuid
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.db import get_db
+from app.dependencies import get_current_user, require_verified
+from app.models.user import User
+from app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse, UpdateProfileRequest, UserResponse
+from app.services.events import log_event
+from app.services.image_upload import load_and_strip_exif
+from app.services.security import create_access_token, hash_password, verify_password
+from app.services.storage import get_public_url, put_object
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+# Cap stored avatar dimensions; avatars are small UI elements, not full photos.
+_AVATAR_MAX_DIMENSION = 512
+
+
+def _to_user_response(user: User) -> UserResponse:
+    # avatar_url is derived, never stored/serialized directly from the storage key.
+    avatar_url = (
+        get_public_url(user.profile_photo_storage_key)
+        if user.profile_photo_storage_key
+        else None
+    )
+    return UserResponse.model_validate(user).model_copy(update={"avatar_url": avatar_url})
+
+
+@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def register(
+    payload: RegisterRequest,
+    db: Session = Depends(get_db),
+    src: str | None = Query(default=None),
+    ref: str | None = Query(default=None),
+) -> UserResponse:
+    # Registration never requires a profile photo; profile_photo_storage_key stays
+    # null until the user optionally uploads one via POST /auth/me/avatar.
+    existing = db.scalar(select(User).where(User.email == payload.email.lower()))
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists",
+        )
+
+    user = User(
+        email=payload.email.lower(),
+        password_hash=hash_password(payload.password),
+        first_name=payload.first_name.strip(),
+        last_name=payload.last_name.strip(),
+        is_booker=payload.is_booker,
+        is_act_owner=payload.is_act_owner,
+        is_admin=False,
+    )
+    db.add(user)
+    db.flush()
+    log_event(
+        db,
+        "signup_started",
+        user_id=user.id,
+        src=src,
+        offering_slug=ref if src == "public_offering" else None,
+        invite_token=ref if src == "invite" else None,
+    )
+    db.commit()
+    db.refresh(user)
+    return _to_user_response(user)
+
+
+@router.post("/login", response_model=TokenResponse)
+def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
+    user = db.scalar(select(User).where(User.email == payload.email.lower()))
+    if (
+        user is None
+        or user.password_hash is None
+        or not verify_password(payload.password, user.password_hash)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
+
+    token = create_access_token(user.id, user.email, user.is_admin)
+    return TokenResponse(access_token=token)
+
+
+@router.get("/me", response_model=UserResponse)
+def me(current_user: User = Depends(get_current_user)) -> UserResponse:
+    # Authz: bearer token must map to an existing user; any authenticated user may read self.
+    return _to_user_response(current_user)
+
+
+@router.patch("/me/profile", response_model=UserResponse)
+def update_my_profile(
+    payload: UpdateProfileRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> UserResponse:
+    # Authz: users may update self-reported trainer flags and rider skill only.
+    if payload.is_act_manager is not None:
+        current_user.is_act_manager = payload.is_act_manager
+    if payload.is_booking_coordinator is not None:
+        current_user.is_booking_coordinator = payload.is_booking_coordinator
+    if payload.booker_experience_level is not None:
+        current_user.booker_experience_level = payload.booker_experience_level
+    db.commit()
+    db.refresh(current_user)
+    return _to_user_response(current_user)
+
+
+@router.post("/me/avatar", response_model=UserResponse)
+async def upload_my_avatar(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_verified),
+) -> UserResponse:
+    # Authz: identity comes from the bearer token (require_verified), not the
+    # request body/path, so a user can only ever replace their own avatar. Requires
+    # verification so unverified/unmoderated accounts can't upload arbitrary images.
+    raw = await file.read()
+    jpeg_bytes = load_and_strip_exif(raw, max_dimension=_AVATAR_MAX_DIMENSION)
+    storage_key = f"avatars/{current_user.id}/{uuid.uuid4()}.jpg"
+    put_object(storage_key, jpeg_bytes)
+
+    current_user.profile_photo_storage_key = storage_key
+    db.commit()
+    db.refresh(current_user)
+    return _to_user_response(current_user)

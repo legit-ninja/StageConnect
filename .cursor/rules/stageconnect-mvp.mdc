@@ -1,0 +1,65 @@
+---
+description: StageConnect MVP scope, priorities, and out-of-scope boundaries
+alwaysApply: true
+---
+
+# Project: StageConnect — Booker / Act-owner Gig Marketplace MVP
+
+## What this platform is
+
+A trust-first marketplace connecting bookers with verified acts and act owners for live music experiences — paid gigs or free promoter-only gigs after a verified connection.
+
+## Non-negotiable priorities (in order)
+
+1. **Safety & anti-abuse controls** — preserve platform visibility into who connects with whom. No feature lets accounts fully leave the platform to transact or communicate.
+2. **Identity verification** — unverified accounts cannot request gigs, host offerings, or send promoter invites.
+3. **Location privacy** — act service area (`acts` address/lat/lng) is private; offering venue area is public at approximate precision only until gig confirmed.
+4. **Everything auditable** — gigs, promoter connections, payments (when enabled), and admin actions logged with timestamps and actor IDs.
+
+## MVP scope
+
+### Users & roles
+
+- Single `User` with `is_booker`, `is_act_owner`, optional manager/coordinator flags, `is_admin`
+- Email + password auth; OAuth design documented, implementation optional
+- `verification_status`, `is_minor`, `guardian_user_id`
+
+### Acts & offerings
+
+- `Act` + `Genre` catalog; offerings linked to acts
+- `Offering`: activity type, price, slug, public venue fields, promoter-only flag, 21+ flag, equipment/sound fields
+- Availability slots for bookable calendar
+
+### Promoter connections
+
+- `InviteToken` + `PromoterConnection` (owner-confirmed, guardian path for minors)
+- Free gigs require active connection when `promoter_only_allowed`
+
+### Gigs
+
+- `GigRequest` lifecycle: counter-offer, snapshot on approve, cancellation releases slots
+- Messaging via `Thread` on gig or active promoter connection only
+
+### Payments
+
+- Config-gated: `PAYMENTS_ENABLED=false` at launch; Stripe Connect when enabled
+- No off-platform payment copy
+
+### Trust & safety
+
+- Platform flags, admin verification queue, audit log
+- Public serializers are allowlists (`PublicOffering`, public act endpoints)
+
+## Explicitly OUT of scope for MVP
+
+- Ticketing at scale, rider/family group bookings (equine-era feature removed)
+- Full automated content moderation (fields exist; may auto-approve)
+- Mobile apps, push notifications
+- Multi-region payments compliance beyond first launch market
+
+## Code conventions
+
+- Python: FastAPI, typed Pydantic schemas, SQLAlchemy + Alembic
+- Frontend: Next.js + TypeScript, CSS modules + design tokens
+- Every sensitive endpoint: authz check with comment explaining caller permission
+- When unsure on safety (minors, payments, public fields), stop and ask
